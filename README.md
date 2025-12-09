@@ -183,9 +183,6 @@ Deploy via GitHub Pages / Netlify with HTTPS and a hosted TF.js model.
 
 Add audio feedback (“Good 8!” / “Close the loop more.”).
 
-📄 License
-
-MIT (or any license you prefer).
 
 👤 Author
 
