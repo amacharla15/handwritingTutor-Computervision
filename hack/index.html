@@ -1,0 +1,472 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Camera, Grid3x3, Mic, MicOff, Play, Pause, RotateCcw, Award } from 'lucide-react';
+
+const HandwritingTutor = () => {
+  const [isActive, setIsActive] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [showGrid, setShowGrid] = useState(true);
+  const [mode, setMode] = useState('practice');
+  const [currentPrompt, setCurrentPrompt] = useState(0);
+  const [score, setScore] = useState(0);
+  const [recentDigits, setRecentDigits] = useState([]);
+  const [feedback, setFeedback] = useState(null);
+  const [pageDetected, setPageDetected] = useState(false);
+  const [error, setError] = useState(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const lastFeedbackTime = useRef(0);
+
+  const practicePrompts = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '-', '×', '÷', '='];
+  
+  const heuristicRules = {
+    '0': { type: 'loop', tip: 'Close the loop on your 0' },
+    '6': { type: 'loop', tip: 'Close the loop on your 6' },
+    '8': { type: 'loop', tip: 'Make sure both loops are closed on your 8' },
+    '9': { type: 'loop', tip: 'Close the loop on your 9' },
+    '1': { type: 'stem', tip: 'Keep your stem vertical' },
+    '4': { type: 'stem', tip: 'Keep your vertical line straight' },
+    '7': { type: 'stem', tip: 'Keep your stem vertical' },
+  };
+
+  // Check if page is running in secure context
+  const isSecure = () =>
+    window.isSecureContext ||
+    location.protocol === 'https:' ||
+    /^localhost$|^127\.0\.0\.1$/.test(location.hostname);
+
+  // Try to pick a back/rear camera
+  const pickBackCamera = async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videos = devices.filter(d => d.kind === 'videoinput');
+      const back = videos.find(d => /back|rear|environment/i.test(d.label)) || videos[0];
+      return back?.deviceId;
+    } catch {
+      return null;
+    }
+  };
+
+  const startCamera = async () => {
+    setError(null);
+
+    // Security checks
+    if (!isSecure()) {
+      setError('Camera requires HTTPS or localhost. Open this page on https:// or http://localhost.');
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('getUserMedia not supported in this browser.');
+      return;
+    }
+
+    try {
+      let stream;
+      
+      // Try environment camera first
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        });
+      } catch {
+        // Try explicit device ID
+        const deviceId = await pickBackCamera();
+        if (deviceId) {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { 
+                deviceId: { exact: deviceId }, 
+                width: { ideal: 1280 }, 
+                height: { ideal: 720 } 
+              }
+            });
+          } catch {
+            // Fall back to default camera
+            stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          }
+        } else {
+          // Final fallback
+          stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        }
+      }
+
+      streamRef.current = stream;
+      if (!videoRef.current) return;
+
+      videoRef.current.srcObject = stream;
+      
+      videoRef.current.onloadedmetadata = async () => {
+        try {
+          await videoRef.current.play();
+          setCameraReady(true);
+          setIsActive(true);
+          // Simulate page detection
+          setTimeout(() => setPageDetected(true), 1500);
+        } catch (err) {
+          console.error('Video play error:', err);
+          setError('Video failed to play. On iOS/Safari, ensure you tapped Start and the page is in the foreground.');
+        }
+      };
+    } catch (err) {
+      console.error('Camera error:', err);
+      
+      // Granular error messages
+      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+        setError('Camera access is blocked. Click the lock icon → Site settings → set Camera to "Allow". Also check OS privacy settings for your browser.');
+      } else if (err.name === 'NotFoundError' || err.name === 'OverconstrainedError') {
+        setError('No usable camera found (or requested camera unavailable). Try a different device or remove constraints.');
+      } else if (err.name === 'NotReadableError') {
+        setError('Camera is in use by another app/tab. Close Zoom/Meet/other tabs and retry.');
+      } else {
+        setError(`Camera error: ${err.message || err.name}`);
+      }
+    }
+  };
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      try { 
+        videoRef.current.pause(); 
+      } catch {}
+      videoRef.current.srcObject = null;
+      videoRef.current.onloadedmetadata = null;
+    }
+    setIsActive(false);
+    setPageDetected(false);
+    setCameraReady(false);
+  };
+
+  const speak = (text) => {
+    if (isMuted || !text) return;
+    try { 
+      speechSynthesis.cancel(); 
+    } catch {}
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.9;
+    u.pitch = 1.0;
+    speechSynthesis.speak(u);
+  };
+
+  const simulateRecognition = () => {
+    const now = Date.now();
+    if (now - lastFeedbackTime.current < 1000) return;
+    
+    const randomIndex = Math.floor(Math.random() * 15);
+    const recognized = practicePrompts[randomIndex];
+    const confidence = 0.75 + Math.random() * 0.2;
+    
+    const shouldGiveTip = Math.random() < 0.3 && heuristicRules[recognized];
+    
+    if (shouldGiveTip) {
+      const tip = heuristicRules[recognized].tip;
+      setFeedback({
+        character: recognized,
+        confidence,
+        tip,
+        type: heuristicRules[recognized].type,
+        color: 'red'
+      });
+      speak(tip);
+    } else {
+      setFeedback({
+        character: recognized,
+        confidence,
+        tip: null,
+        color: 'green'
+      });
+    }
+    
+    if (mode === 'practice' && recognized === practicePrompts[currentPrompt]) {
+      setScore(s => s + 1);
+      setCurrentPrompt(p => (p + 1) % practicePrompts.length);
+    }
+    
+    setRecentDigits(prev => [...prev.slice(-9), { char: recognized, correct: !shouldGiveTip }]);
+    lastFeedbackTime.current = now;
+    
+    setTimeout(() => setFeedback(null), 2000);
+  };
+
+  const resetSession = () => {
+    setScore(0);
+    setCurrentPrompt(0);
+    setRecentDigits([]);
+    setFeedback(null);
+  };
+
+  // Handle tab visibility - stop camera when hidden
+  useEffect(() => {
+    const onVis = () => {
+      if (document.hidden) {
+        try { 
+          speechSynthesis.cancel(); 
+        } catch {}
+        stopCamera();
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      stopCamera();
+    };
+  }, []);
+
+  // Warn if running in iframe
+  useEffect(() => {
+    if (window.top !== window.self) {
+      console.warn('Running inside an iframe. Ensure the iframe has allow="camera".');
+      console.info('If camera permission keeps looping, try opening this artifact in a new tab.');
+    }
+  }, []);
+
+  const consistency = recentDigits.length > 0 
+    ? Math.round((recentDigits.filter(d => d.correct).length / recentDigits.length) * 100)
+    : 0;
+
+  return (
+    <div className="flex flex-col h-screen bg-gray-900 text-white">
+      {/* Header */}
+      <div className="bg-gray-800 p-4 shadow-lg">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Camera className="w-6 h-6 text-blue-400" />
+            <h1 className="text-xl font-bold">Handwriting Tutor</h1>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setMode(mode === 'practice' ? 'free' : 'practice')}
+              className="px-3 py-1 bg-gray-700 rounded text-sm hover:bg-gray-600"
+            >
+              {mode === 'practice' ? 'Practice' : 'Free'} Mode
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 relative overflow-hidden">
+        {/* Camera View */}
+        <video
+          ref={videoRef}
+          className="absolute inset-0 w-full h-full object-contain bg-black"
+          playsInline
+          muted
+        />
+        
+        {/* Error Message */}
+        {error && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-90 z-50">
+            <div className="max-w-md p-6 bg-red-900 bg-opacity-50 rounded-lg text-center">
+              <div className="text-4xl mb-4">⚠️</div>
+              <div className="text-lg font-bold mb-2">Camera Error</div>
+              <div className="text-sm text-gray-300 whitespace-pre-line">{error}</div>
+              <button
+                onClick={() => setError(null)}
+                className="mt-4 px-4 py-2 bg-gray-700 rounded hover:bg-gray-600"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
+        
+        {/* Page Detection Overlay */}
+        {isActive && cameraReady && !pageDetected && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-60 z-10">
+            <div className="text-center">
+              <div className="text-2xl mb-4">🎯</div>
+              <div className="text-xl">Align page in view</div>
+              <div className="text-sm text-gray-400 mt-2">Position paper within frame</div>
+              <div className="mt-4">
+                <div className="inline-block w-6 h-6 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Grid Overlay */}
+        {isActive && pageDetected && showGrid && (
+          <div className="absolute inset-0 pointer-events-none">
+            <svg className="w-full h-full">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <line
+                  key={`v${i}`}
+                  x1={`${(i + 1) * 25}%`}
+                  y1="10%"
+                  x2={`${(i + 1) * 25}%`}
+                  y2="90%"
+                  stroke="rgba(59, 130, 246, 0.3)"
+                  strokeWidth="2"
+                />
+              ))}
+              {Array.from({ length: 6 }).map((_, i) => (
+                <line
+                  key={`h${i}`}
+                  x1="5%"
+                  y1={`${10 + i * 13.33}%`}
+                  x2="95%"
+                  y2={`${10 + i * 13.33}%`}
+                  stroke="rgba(59, 130, 246, 0.3)"
+                  strokeWidth="2"
+                />
+              ))}
+            </svg>
+          </div>
+        )}
+
+        {/* Feedback Overlay */}
+        {feedback && isActive && pageDetected && (
+          <div className="absolute top-20 left-1/2 transform -translate-x-1/2 bg-black bg-opacity-80 rounded-lg p-4 max-w-sm z-20">
+            <div className="flex items-center gap-3">
+              <div className={`text-4xl font-bold ${feedback.color === 'green' ? 'text-green-400' : 'text-red-400'}`}>
+                {feedback.character}
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-1">
+                  <div className="h-2 bg-gray-700 rounded-full flex-1 overflow-hidden">
+                    <div 
+                      className={`h-full ${feedback.color === 'green' ? 'bg-green-500' : 'bg-orange-500'}`}
+                      style={{ width: `${feedback.confidence * 100}%` }}
+                    />
+                  </div>
+                  <span className="text-xs">{Math.round(feedback.confidence * 100)}%</span>
+                </div>
+                {feedback.tip && (
+                  <div className="text-sm text-yellow-300">{feedback.tip}</div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Mode-specific UI */}
+        {isActive && pageDetected && mode === 'practice' && (
+          <div className="absolute top-4 left-4 bg-black bg-opacity-80 rounded-lg p-4 z-10">
+            <div className="text-sm text-gray-400 mb-1">Write this character:</div>
+            <div className="text-5xl font-bold text-blue-400">{practicePrompts[currentPrompt]}</div>
+            <div className="text-sm text-gray-400 mt-2">
+              Progress: {score}/{practicePrompts.length}
+            </div>
+          </div>
+        )}
+
+        {isActive && pageDetected && mode === 'free' && (
+          <div className="absolute top-4 left-4 bg-black bg-opacity-80 rounded-lg p-4 z-10">
+            <div className="flex items-center gap-2 mb-2">
+              <Award className="w-5 h-5 text-yellow-400" />
+              <span className="font-bold">Consistency Score</span>
+            </div>
+            <div className="text-3xl font-bold text-blue-400">{consistency}%</div>
+            <div className="text-xs text-gray-400 mt-1">Last 10 characters</div>
+          </div>
+        )}
+
+        {/* Recent Digits */}
+        {recentDigits.length > 0 && isActive && pageDetected && (
+          <div className="absolute top-4 right-4 bg-black bg-opacity-80 rounded-lg p-3 z-10">
+            <div className="text-xs text-gray-400 mb-2">Recent:</div>
+            <div className="flex gap-1 flex-wrap max-w-[120px]">
+              {recentDigits.map((d, i) => (
+                <div
+                  key={i}
+                  className={`w-6 h-6 flex items-center justify-center text-xs rounded ${
+                    d.correct ? 'bg-green-600' : 'bg-red-600'
+                  }`}
+                >
+                  {d.char}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Inactive State */}
+        {!isActive && (
+          <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
+            <div className="text-center">
+              <Camera className="w-16 h-16 mx-auto mb-4 text-gray-600" />
+              <div className="text-xl text-gray-400">Camera Inactive</div>
+              <div className="text-sm text-gray-500 mt-2">Tap Start to begin</div>
+              {window.top !== window.self && (
+                <div className="mt-4 text-xs text-yellow-400 max-w-xs mx-auto">
+                  💡 Running in iframe: If camera doesn't work, open in new tab
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Controls */}
+      <div className="bg-gray-800 p-4 shadow-lg">
+        <div className="flex items-center justify-around max-w-md mx-auto">
+          <button
+            onClick={isActive ? stopCamera : startCamera}
+            className={`flex flex-col items-center gap-1 p-3 rounded-lg ${
+              isActive ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'
+            }`}
+          >
+            {isActive ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6" />}
+            <span className="text-xs">{isActive ? 'Stop' : 'Start'}</span>
+          </button>
+
+          <button
+            onClick={() => setIsMuted(!isMuted)}
+            className={`flex flex-col items-center gap-1 p-3 rounded-lg ${
+              isMuted ? 'bg-gray-700' : 'bg-gray-600'
+            } hover:bg-gray-500`}
+          >
+            {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+            <span className="text-xs">{isMuted ? 'Unmute' : 'Mute'}</span>
+          </button>
+
+          <button
+            onClick={() => setShowGrid(!showGrid)}
+            className={`flex flex-col items-center gap-1 p-3 rounded-lg ${
+              showGrid ? 'bg-blue-600' : 'bg-gray-700'
+            } hover:bg-gray-500`}
+          >
+            <Grid3x3 className="w-6 h-6" />
+            <span className="text-xs">Grid</span>
+          </button>
+
+          <button
+            onClick={resetSession}
+            className="flex flex-col items-center gap-1 p-3 rounded-lg bg-gray-700 hover:bg-gray-600"
+          >
+            <RotateCcw className="w-6 h-6" />
+            <span className="text-xs">Reset</span>
+          </button>
+
+          <button
+            onClick={simulateRecognition}
+            disabled={!isActive || !pageDetected}
+            className="flex flex-col items-center gap-1 p-3 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:bg-gray-700 disabled:opacity-50"
+          >
+            <span className="text-xl">✍️</span>
+            <span className="text-xs">Test</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Instructions */}
+      <div className="bg-gray-900 p-3 text-center text-xs text-gray-500">
+        {!isActive && "Grant camera access and tap Start to begin"}
+        {isActive && !pageDetected && "Detecting page alignment..."}
+        {isActive && pageDetected && mode === 'practice' && "Write the prompted character in a grid box, then tap Test"}
+        {isActive && pageDetected && mode === 'free' && "Write any digits or operators - tap Test to simulate recognition"}
+      </div>
+    </div>
+  );
+};
+
+export default HandwritingTutor;
